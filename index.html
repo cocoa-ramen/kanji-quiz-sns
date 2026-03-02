@@ -59,8 +59,13 @@
     return { label: 'ふつう', cls: 'medium' };
   }
   function toHiragana(str) {
-    return str.replace(/[\u30a1-\u30f6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+    return str
+      .replace(/[\u30a1-\u30f6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60)) // カタカナ→ひらがな
+      .replace(/[\uff01-\uff5e]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xfee0)) // 全角英数→半角
+      .trim();
   }
+  // 答え・回答をひらがなに正規化して比較
+  function normalize(str) { return toHiragana(str.trim().toLowerCase()); }
 
   // ── State ──
   let currentUser = null;
@@ -257,6 +262,7 @@
           <span class="difficulty-badge ${dl.cls}">${dl.label}</span>
         </div>
         ${q.hint ? `<div class="hint-section"><span class="hint-label">ヒント</span>${esc(q.hint)}</div>` : ''}
+        ${q.condition ? `<div class="hint-section"><span class="hint-label condition-label">条件</span>${esc(q.condition)}</div>` : ''}
         ${answerAreaHtml}
         <div class="stats-bar">
           <span class="stat"><span class="icon">🎯</span>${q.attempts || 0}人が挑戦</span>
@@ -349,7 +355,7 @@
     const val = inp.value.trim();
     if (!val) return;
 
-    const ok = val === correctAnswer || toHiragana(val) === correctAnswer;
+    const ok = normalize(val) === normalize(correctAnswer);
 
     // UIを即座に更新（Firestoreの再レンダリングより先に保存）
     answeredMap[id] = { correct: ok, answer: correctAnswer };
@@ -404,6 +410,7 @@
     const kanji      = document.getElementById('kanjiInput').value.trim();
     const answer     = document.getElementById('answerInput').value.trim();
     const hint       = document.getElementById('hintInput').value.trim();
+    const condition  = document.getElementById('conditionInput').value.trim();
     const difficulty = document.getElementById('difficultyInput').value;
 
     if (!kanji)  { alert('漢字を入力してください'); return; }
@@ -415,7 +422,7 @@
     try {
       const name = currentUser.displayName || currentUser.email.split('@')[0];
       await addDoc(collection(db, 'quizzes'), {
-        kanji, answer, hint, difficulty,
+        kanji, answer: normalize(answer), hint, condition, difficulty,
         userName:     name,
         color:        nameColor(name),
         uid:          currentUser.uid,
@@ -424,7 +431,7 @@
         commentCount: 0,
         createdAt:    serverTimestamp()
       });
-      ['kanjiInput','answerInput','hintInput'].forEach(id => {
+      ['kanjiInput','answerInput','hintInput','conditionInput'].forEach(id => {
         document.getElementById(id).value = '';
       });
       document.getElementById('postForm').classList.remove('active');
@@ -620,6 +627,7 @@
   .difficulty-badge.easy   { background: #e8f5e9; color: #2e7d32; }
   .hint-section { padding: 0 18px 14px; font-size: 0.82rem; color: var(--muted); font-style: italic; }
   .hint-label { font-style: normal; font-weight: 500; color: var(--gold); margin-right: 4px; font-size: 0.75rem; }
+  .condition-label { color: #2e7d32; }
   .answer-area { border-top: 1px solid var(--paper-dark); padding: 14px 18px; }
   .answer-form { display: flex; gap: 8px; }
   .answer-input {
@@ -769,15 +777,19 @@
     <div class="form-title">難読漢字クイズを投稿する</div>
     <div class="form-row">
       <label>漢字（読めないと思うもの）</label>
-      <input class="kanji-input" type="text" id="kanjiInput" placeholder="例：蝸牛" maxlength="6">
+      <input class="kanji-input" type="text" id="kanjiInput" placeholder="例：蝸牛">
     </div>
     <div class="form-row">
-      <label>正解の読み方</label>
+      <label>正解の読み方（ひらがなで入力）</label>
       <input class="text-input" type="text" id="answerInput" placeholder="例：かたつむり">
     </div>
     <div class="form-row">
       <label>ヒント（省略可）</label>
       <textarea class="text-input hint-input" id="hintInput" placeholder="例：梅雨の季節によく見かける生き物"></textarea>
+    </div>
+    <div class="form-row">
+      <label>条件（省略可）</label>
+      <textarea class="text-input hint-input" id="conditionInput" placeholder="例：〇〇〇〇（4文字）、送り仮名あり"></textarea>
     </div>
     <div class="form-row">
       <label>難易度</label>
