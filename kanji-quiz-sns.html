@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>読めるかな？ — 難読漢字SNS</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@400;700;900&family=Noto+Sans+JP:wght@300;400;500&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+    signOut, onAuthStateChanged, updateProfile
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import {
+    getFirestore, collection, doc, addDoc, setDoc, updateDoc,
+    onSnapshot, query, orderBy, serverTimestamp, getDoc, increment,
+    arrayUnion, arrayRemove
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyAuIB0PJBs3hMXAo72fmNAlHEid85kThMc",
+    authDomain: "kanji-quiz-sns.firebaseapp.com",
+    projectId: "kanji-quiz-sns",
+    storageBucket: "kanji-quiz-sns.firebasestorage.app",
+    messagingSenderId: "355332099685",
+    appId: "1:355332099685:web:dd6f01bfc022fdf8cd408c",
+    measurementId: "G-D73BZ0P1PF"
+  };
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  // ── Utilities ──
+  const COLORS = ['#c0392b','#2c5f2e','#1a237e','#4a148c','#b8860b','#37474f','#00695c','#4e342e'];
+  function nameColor(name) {
+    let h = 0;
+    for (const c of (name || '?')) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
+    return COLORS[Math.abs(h) % COLORS.length];
+  }
+  function relativeTime(ts) {
+    if (!ts) return 'たった今';
+    const diff = Date.now() - ts.toMillis();
+    const m = Math.floor(diff / 60000);
+    if (m < 1)  return 'たった今';
+    if (m < 60) return `${m}分前`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}時間前`;
+    return `${Math.floor(h / 24)}日前`;
+  }
+  function esc(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function diffLabel(d) {
+    if (d === 'hard') return { label: '超難問', cls: 'hard' };
+    if (d === 'easy') return { label: 'かんたん', cls: 'easy' };
+    return { label: 'ふつう', cls: 'medium' };
+  }
+  function toHiragana(str) {
+    return str.replace(/[\u30a1-\u30f6]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+  }
+
+  // ── State ──
+  let currentUser = null;
+  let unsubFeed   = null;
+  const commentListeners = {};
+
+  // 回答済みの状態を localStorage で永続化
+  // { quizId: { correct: bool, answer: string } }
+  let answeredMap = {};
+  try {
+    const saved = localStorage.getItem('answeredQuizzes');
+    if (saved) answeredMap = JSON.parse(saved);
+  } catch(e) {}
+
+  function saveAnswered() {
+    try { localStorage.setItem('answeredQuizzes', JSON.stringify(answeredMap)); } catch(e) {}
+  }
+
+  // ════════════════════════════════════════
+  // AUTH MODAL
+  // ════════════════════════════════════════
+  window.showAuth = function(mode = 'login') {
+    document.getElementById('authModal').style.display = 'flex';
+    document.getElementById('authModal').dataset.mode = mode;
+    document.getElementById('authTitle').textContent   = mode === 'login' ? 'ログイン' : 'アカウント登録';
+    document.getElementById('authNameRow').style.display = mode === 'register' ? 'block' : 'none';
+    document.getElementById('authSubmitBtn').textContent = mode === 'login' ? 'ログイン' : '登録する';
+    document.getElementById('authToggleText').innerHTML  = mode === 'login'
+      ? 'アカウントをお持ちでない方は <a href="#" id="authToggle">新規登録</a>'
+      : 'すでにアカウントをお持ちの方は <a href="#" id="authToggle">ログイン</a>';
+    document.getElementById('authToggle').onclick = (e) => {
+      e.preventDefault();
+      window.showAuth(mode === 'login' ? 'register' : 'login');
+    };
+    document.getElementById('authError').textContent = '';
+    ['authEmail','authPassword','authName'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+  };
+
+  window.hideAuth = function() {
+    document.getElementById('authModal').style.display = 'none';
+  };
+
+  window.submitAuth = async function() {
+    const mode     = document.getElementById('authModal').dataset.mode;
+    const email    = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    const name     = document.getElementById('authName').value.trim();
+    const errEl    = document.getElementById('authError');
+    const btn      = document.getElementById('authSubmitBtn');
+
+    if (!email || !password) { errEl.textContent = 'メールとパスワードを入力してください'; return; }
+    if (mode === 'register' && !name) { errEl.textContent = 'ユーザー名を入力してください'; return; }
+    if (mode === 'register' && password.length < 6) { errEl.textContent = 'パスワードは6文字以上にしてください'; return; }
+
+    btn.disabled = true;
+    btn.textContent = '処理中…';
+    errEl.textContent = '';
+
+    try {
+      if (mode === 'register') {
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        await updateProfile(cred.user, { displayName: name });
+        await setDoc(doc(db, 'users', cred.user.uid), { displayName: name, color: nameColor(name) });
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+      }
+      window.hideAuth();
+    } catch (e) {
+      const msgs = {
+        'auth/email-already-in-use': 'このメールは既に登録済みです',
+        'auth/invalid-email':        'メールアドレスの形式が正しくありません',
+        'auth/user-not-found':       'メールアドレスが見つかりません',
+        'auth/wrong-password':       'パスワードが違います',
+        'auth/invalid-credential':   'メールまたはパスワードが正しくありません',
+        'auth/too-many-requests':    'しばらくしてから再試行してください',
+      };
+      errEl.textContent = msgs[e.code] || `エラー: ${e.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = mode === 'login' ? 'ログイン' : '登録する';
+    }
+  };
+
+  window.doSignOut = async function() {
+    await signOut(auth);
+  };
+
+  // ════════════════════════════════════════
+  // AUTH STATE CHANGE
+  // ════════════════════════════════════════
+  onAuthStateChanged(auth, (user) => {
+    currentUser = user;
+    const headerRight = document.getElementById('headerRight');
+
+    if (user) {
+      const name  = user.displayName || user.email.split('@')[0];
+      const color = nameColor(name);
+      headerRight.innerHTML = `
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="width:30px;height:30px;border-radius:50%;background:${color};color:white;
+            display:flex;align-items:center;justify-content:center;
+            font-family:'Noto Serif JP',serif;font-weight:700;font-size:0.8rem;">${esc(name[0])}</div>
+          <span style="color:#f5f0e8;font-size:0.82rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(name)}</span>
+          <button class="btn-post" onclick="toggleForm()">＋ 投稿</button>
+          <button class="btn-logout" onclick="doSignOut()">ログアウト</button>
+        </div>`;
+      document.getElementById('fab').style.display = 'flex';
+    } else {
+      headerRight.innerHTML = `
+        <button class="btn-post" onclick="showAuth('login')">ログイン</button>
+        <button class="btn-register" onclick="showAuth('register')">新規登録</button>`;
+      document.getElementById('fab').style.display = 'none';
+    }
+    startFeed();
+  });
+
+  // ════════════════════════════════════════
+  // FEED — Firestore リアルタイム
+  // ════════════════════════════════════════
+  function startFeed() {
+    if (unsubFeed) { unsubFeed(); unsubFeed = null; }
+    const feed = document.getElementById('feed');
+    feed.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);font-size:0.9rem;">読み込み中…</div>';
+
+    const q = query(collection(db, 'quizzes'), orderBy('createdAt', 'desc'));
+    unsubFeed = onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) {
+        feed.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);">まだクイズがありません。最初の一問を投稿しましょう！</div>';
+        return;
+      }
+      // keep track of open comment sections
+      const openIds = new Set(
+        [...document.querySelectorAll('.comment-section.open')].map(el => el.id.replace('comments-',''))
+      );
+      feed.innerHTML = snapshot.docs.map(d => renderCard(d, openIds)).join('');
+    });
+  }
+
+  function renderCard(docSnap, openIds = new Set()) {
+    const q   = docSnap.data();
+    const id  = docSnap.id;
+    const dl  = diffLabel(q.difficulty);
+    const rate = q.attempts > 0 ? Math.round((q.correct || 0) / q.attempts * 100) : 0;
+    const likes     = q.likes || 0;
+    const likedByMe = currentUser && (q.likedBy || []).includes(currentUser.uid);
+    const commentCount = q.commentCount || 0;
+    const isOpen = openIds.has(id);
+    const color  = q.color || nameColor(q.userName || '?');
+    const uname  = esc(q.userName || '匿名');
+    const myInitial = currentUser ? esc((currentUser.displayName || '?')[0]) : '？';
+
+    // 回答済みかどうかチェック
+    const answered = answeredMap[id];
+    const answerAreaHtml = answered
+      ? `
+        <div class="answer-area">
+          <div class="answer-form">
+            <input class="answer-input" type="text" disabled placeholder="回答済み">
+            <button class="btn-answer" disabled>回答する</button>
+          </div>
+          <div class="answer-result ${answered.correct ? 'correct' : 'wrong'}">
+            ${answered.correct
+              ? `✅ 正解！「${esc(answered.answer)}」です！`
+              : `❌ 不正解… 正解は「${esc(answered.answer)}」でした`}
+          </div>
+          <div class="answer-count" id="count-${id}">正解率 ${rate}%（${q.attempts || 0}人挑戦）</div>
+        </div>`
+      : `
+        <div class="answer-area">
+          <div class="answer-form">
+            <input class="answer-input" type="text" id="inp-${id}"
+              placeholder="読み方を入力…"
+              onkeydown="if(event.key==='Enter')window._check('${id}','${esc(q.answer)}')">
+            <button class="btn-answer" onclick="window._check('${id}','${esc(q.answer)}')">回答する</button>
+          </div>
+          <div class="answer-result" id="result-${id}"></div>
+          <div class="answer-count" id="count-${id}">正解率 ${rate}%（${q.attempts || 0}人挑戦）</div>
+        </div>`;
+
+    return `
+      <div class="quiz-card" id="card-${id}">
+        <div class="card-header">
+          <div class="avatar" style="background:${color}">${uname[0]}</div>
+          <div class="user-info">
+            <div class="name">${uname}</div>
+            <div class="time">${relativeTime(q.createdAt)}</div>
+          </div>
+        </div>
+        <div class="kanji-display">
+          <div class="kanji-main">${esc(q.kanji)}</div><br>
+          <span class="difficulty-badge ${dl.cls}">${dl.label}</span>
+        </div>
+        ${q.hint ? `<div class="hint-section"><span class="hint-label">ヒント</span>${esc(q.hint)}</div>` : ''}
+        ${answerAreaHtml}
+        <div class="stats-bar">
+          <span class="stat"><span class="icon">🎯</span>${q.attempts || 0}人が挑戦</span>
+          <span class="stat"><span class="icon">✅</span>${q.correct || 0}人正解</span>
+        </div>
+        <div class="action-bar">
+          <button class="btn-action btn-like ${likedByMe ? 'liked' : ''}" id="like-btn-${id}"
+            onclick="window._like('${id}')">
+            <span class="like-icon">${likedByMe ? '❤️' : '🤍'}</span>
+            <span>${likes}</span>
+          </button>
+          <button class="btn-action btn-comment ${isOpen ? 'open' : ''}" id="cbtn-${id}"
+            onclick="window._toggleComments('${id}')">
+            💬 <span id="cc-${id}">${commentCount}</span>
+          </button>
+        </div>
+        <div class="comment-section ${isOpen ? 'open' : ''}" id="comments-${id}">
+          <div class="comment-list" id="clist-${id}">
+            <div style="padding:8px 18px 0;font-size:0.78rem;color:var(--muted);">読み込み中…</div>
+          </div>
+          <div class="comment-input-row">
+            <div class="comment-my-avatar">${myInitial}</div>
+            <input class="comment-field" type="text" id="cinp-${id}"
+              placeholder="${currentUser ? 'コメントを入力…' : 'ログインするとコメントできます'}"
+              ${currentUser ? '' : 'disabled'}
+              onkeydown="if(event.key==='Enter')window._postComment('${id}')">
+            <button class="btn-send" onclick="window._postComment('${id}')" ${currentUser ? '' : 'disabled'}>→</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ── コメント リアルタイム ──
+  window._toggleComments = function(id) {
+    const section = document.getElementById(`comments-${id}`);
+    const btn     = document.getElementById(`cbtn-${id}`);
+    if (!section) return;
+    const isOpen = section.classList.toggle('open');
+    btn.classList.toggle('open', isOpen);
+
+    if (isOpen && !commentListeners[id]) {
+      const cq = query(collection(db, 'quizzes', id, 'comments'), orderBy('createdAt', 'asc'));
+      commentListeners[id] = onSnapshot(cq, (snap) => {
+        const list = document.getElementById(`clist-${id}`);
+        if (!list) { commentListeners[id](); delete commentListeners[id]; return; }
+        if (snap.empty) {
+          list.innerHTML = '<div style="padding:8px 18px 0;font-size:0.78rem;color:var(--muted);">まだコメントはありません</div>';
+        } else {
+          list.innerHTML = snap.docs.map(d => {
+            const c = d.data();
+            const col = c.color || nameColor(c.userName || '?');
+            return `
+              <div class="comment-item">
+                <div class="comment-avatar" style="background:${col}">${esc((c.userName||'?')[0])}</div>
+                <div class="comment-bubble">
+                  <div class="comment-user">${esc(c.userName||'匿名')}</div>
+                  <div class="comment-text">${esc(c.text)}</div>
+                  <div class="comment-time">${relativeTime(c.createdAt)}</div>
+                </div>
+              </div>`;
+          }).join('');
+        }
+      });
+    } else if (!isOpen && commentListeners[id]) {
+      commentListeners[id]();
+      delete commentListeners[id];
+    }
+    if (isOpen) setTimeout(() => document.getElementById(`cinp-${id}`)?.focus(), 150);
+  };
+
+  // ── Like ──
+  window._like = async function(id) {
+    if (!currentUser) { window.showAuth('login'); return; }
+    const ref  = doc(db, 'quizzes', id);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return;
+    const likedBy      = snap.data().likedBy || [];
+    const alreadyLiked = likedBy.includes(currentUser.uid);
+    await updateDoc(ref, {
+      likedBy: alreadyLiked ? arrayRemove(currentUser.uid) : arrayUnion(currentUser.uid),
+      likes:   increment(alreadyLiked ? -1 : 1)
+    });
+  };
+
+  // ── Answer ──
+  window._check = async function(id, correctAnswer) {
+    const inp    = document.getElementById(`inp-${id}`);
+    const result = document.getElementById(`result-${id}`);
+    if (!inp) return;
+    const val = inp.value.trim();
+    if (!val) return;
+
+    const ok = val === correctAnswer || toHiragana(val) === correctAnswer;
+
+    // UIを即座に更新（Firestoreの再レンダリングより先に保存）
+    answeredMap[id] = { correct: ok, answer: correctAnswer };
+    saveAnswered();
+
+    // 結果を表示してフォームを無効化
+    result.className = ok ? 'answer-result correct' : 'answer-result wrong';
+    result.innerHTML = ok
+      ? `✅ 正解！「${esc(correctAnswer)}」です！`
+      : `❌ 不正解… 正解は「${esc(correctAnswer)}」でした`;
+    inp.disabled = true;
+    document.querySelector(`#card-${id} .btn-answer`).disabled = true;
+
+    // Firestoreのカウントを更新（これが再レンダリングを起こすが answeredMap で対応済み）
+    const ref = doc(db, 'quizzes', id);
+    await updateDoc(ref, {
+      attempts: increment(1),
+      ...(ok ? { correct: increment(1) } : {})
+    });
+  };
+
+  // ── Post Comment ──
+  window._postComment = async function(id) {
+    if (!currentUser) { window.showAuth('login'); return; }
+    const inp  = document.getElementById(`cinp-${id}`);
+    const text = inp.value.trim();
+    if (!text) return;
+
+    const name = currentUser.displayName || currentUser.email.split('@')[0];
+    inp.value  = '';
+    await addDoc(collection(db, 'quizzes', id, 'comments'), {
+      text, uid: currentUser.uid,
+      userName:  name,
+      color:     nameColor(name),
+      createdAt: serverTimestamp()
+    });
+    await updateDoc(doc(db, 'quizzes', id), { commentCount: increment(1) });
+  };
+
+  // ════════════════════════════════════════
+  // QUIZ POST
+  // ════════════════════════════════════════
+  window.toggleForm = function() {
+    if (!currentUser) { window.showAuth('login'); return; }
+    const form = document.getElementById('postForm');
+    form.classList.toggle('active');
+    if (form.classList.contains('active')) document.getElementById('kanjiInput').focus();
+  };
+
+  window.submitQuiz = async function() {
+    if (!currentUser) { window.showAuth('login'); return; }
+    const kanji      = document.getElementById('kanjiInput').value.trim();
+    const answer     = document.getElementById('answerInput').value.trim();
+    const hint       = document.getElementById('hintInput').value.trim();
+    const difficulty = document.getElementById('difficultyInput').value;
+
+    if (!kanji)  { alert('漢字を入力してください'); return; }
+    if (!answer) { alert('読み方を入力してください'); return; }
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true; btn.textContent = '投稿中…';
+
+    try {
+      const name = currentUser.displayName || currentUser.email.split('@')[0];
+      await addDoc(collection(db, 'quizzes'), {
+        kanji, answer, hint, difficulty,
+        userName:     name,
+        color:        nameColor(name),
+        uid:          currentUser.uid,
+        attempts:     0, correct: 0,
+        likes:        0, likedBy: [],
+        commentCount: 0,
+        createdAt:    serverTimestamp()
+      });
+      ['kanjiInput','answerInput','hintInput'].forEach(id => {
+        document.getElementById(id).value = '';
+      });
+      document.getElementById('postForm').classList.remove('active');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch(e) {
+      alert('投稿に失敗しました: ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = '投稿する';
+    }
+  };
+</script>
+
+<style>
+  :root {
+    --ink: #1a1208; --ink-light: #3d2f1a;
+    --paper: #f5f0e8; --paper-dark: #ede5d5;
+    --vermillion: #c0392b; --gold: #b8860b; --gold-light: #d4a843;
+    --muted: #8a7a6a;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--paper); color: var(--ink);
+    font-family: 'Noto Sans JP', sans-serif; min-height: 100vh;
+    background-image:
+      repeating-linear-gradient(0deg, transparent, transparent 39px, rgba(0,0,0,0.04) 39px, rgba(0,0,0,0.04) 40px),
+      repeating-linear-gradient(90deg, transparent, transparent 39px, rgba(0,0,0,0.02) 39px, rgba(0,0,0,0.02) 40px);
+  }
+
+  /* Header */
+  header {
+    background: var(--ink); padding: 14px 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 200;
+    border-bottom: 3px solid var(--vermillion);
+  }
+  .logo {
+    font-family: 'Noto Serif JP', serif; font-weight: 900; font-size: 1.4rem;
+    color: var(--paper); letter-spacing: 0.1em;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo .seal {
+    width: 36px; height: 36px; background: var(--vermillion); border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.95rem; color: white; transform: rotate(-5deg); flex-shrink: 0;
+  }
+  .btn-post {
+    background: var(--vermillion); color: white; border: none;
+    padding: 7px 16px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.82rem; font-weight: 500; border-radius: 4px; cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-post:hover { background: #a93226; }
+  .btn-logout {
+    background: transparent; color: #aaa; border: 1px solid #555;
+    padding: 6px 12px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.78rem; border-radius: 4px; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-logout:hover { border-color: #aaa; color: white; }
+  .btn-register {
+    background: transparent; color: var(--paper); border: 1px solid #888;
+    padding: 7px 14px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.82rem; border-radius: 4px; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-register:hover { border-color: var(--paper); }
+
+  /* Auth Modal */
+  .auth-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6); z-index: 1000;
+    align-items: center; justify-content: center;
+  }
+  .auth-box {
+    background: white; border-radius: 10px; padding: 32px 28px;
+    width: 360px; max-width: 92vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+    animation: slideDown 0.25s ease;
+  }
+  .auth-header {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px;
+  }
+  .auth-title { font-family: 'Noto Serif JP', serif; font-size: 1.2rem; font-weight: 700; color: var(--ink); }
+  .auth-close { background: none; border: none; font-size: 1.4rem; cursor: pointer; color: var(--muted); }
+  .auth-field { margin-bottom: 14px; }
+  .auth-field label { display: block; font-size: 0.78rem; font-weight: 500; color: var(--muted); margin-bottom: 5px; }
+  .auth-field input {
+    width: 100%; border: 2px solid var(--paper-dark); border-radius: 4px;
+    padding: 10px 12px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.9rem; color: var(--ink); background: var(--paper); transition: border-color 0.2s;
+  }
+  .auth-field input:focus { outline: none; border-color: var(--gold); }
+  .auth-error { font-size: 0.8rem; color: var(--vermillion); min-height: 18px; margin-bottom: 8px; }
+  .auth-submit {
+    width: 100%; background: var(--ink); color: white; border: none;
+    padding: 11px; border-radius: 4px; cursor: pointer;
+    font-family: 'Noto Sans JP', sans-serif; font-size: 0.9rem; font-weight: 500;
+    transition: background 0.2s; margin-bottom: 14px;
+  }
+  .auth-submit:hover { background: var(--vermillion); }
+  .auth-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+  .auth-toggle { text-align: center; font-size: 0.82rem; color: var(--muted); }
+  .auth-toggle a { color: var(--gold); text-decoration: none; font-weight: 500; }
+
+  /* Layout */
+  .container { max-width: 680px; margin: 0 auto; padding: 28px 16px; }
+
+  /* Post Form */
+  .post-form {
+    background: white; border: 1px solid #d5c9b5; border-radius: 8px;
+    padding: 24px; margin-bottom: 28px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    display: none; animation: slideDown 0.3s ease;
+  }
+  .post-form.active { display: block; }
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .form-title {
+    font-family: 'Noto Serif JP', serif; font-size: 1rem; font-weight: 700;
+    margin-bottom: 16px; color: var(--ink-light);
+    border-bottom: 1px solid var(--paper-dark); padding-bottom: 10px;
+  }
+  .form-row { margin-bottom: 14px; }
+  label { display: block; font-size: 0.78rem; font-weight: 500; color: var(--muted); margin-bottom: 5px; }
+  .kanji-input {
+    width: 100%; border: 2px solid var(--paper-dark); border-radius: 4px;
+    padding: 12px 14px; font-family: 'Noto Serif JP', serif;
+    font-size: 2.5rem; font-weight: 700; text-align: center;
+    color: var(--ink); background: var(--paper); transition: border-color 0.2s; letter-spacing: 0.1em;
+  }
+  .kanji-input:focus { outline: none; border-color: var(--gold); }
+  .text-input {
+    width: 100%; border: 2px solid var(--paper-dark); border-radius: 4px;
+    padding: 10px 12px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.9rem; color: var(--ink); background: var(--paper); transition: border-color 0.2s;
+  }
+  .text-input:focus { outline: none; border-color: var(--gold); }
+  .hint-input { resize: none; height: 70px; }
+  .form-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+  .btn-cancel {
+    background: none; border: 1px solid #ccc; padding: 8px 18px;
+    border-radius: 4px; cursor: pointer;
+    font-family: 'Noto Sans JP', sans-serif; font-size: 0.85rem; color: var(--muted);
+  }
+  .btn-submit {
+    background: var(--ink); color: white; border: none;
+    padding: 8px 20px; border-radius: 4px; cursor: pointer;
+    font-family: 'Noto Sans JP', sans-serif; font-size: 0.85rem; font-weight: 500;
+    transition: background 0.2s;
+  }
+  .btn-submit:hover { background: var(--vermillion); }
+  .btn-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* Feed */
+  .feed-header { display: flex; align-items: center; margin-bottom: 16px; }
+  .feed-title { font-family: 'Noto Serif JP', serif; font-size: 0.85rem; font-weight: 700; color: var(--muted); letter-spacing: 0.1em; }
+
+  /* Quiz Card */
+  .quiz-card {
+    background: white; border: 1px solid #d5c9b5; border-radius: 8px;
+    margin-bottom: 20px; overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: fadeIn 0.4s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .card-header { padding: 14px 18px 0; display: flex; align-items: center; gap: 10px; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Noto Serif JP', serif; font-size: 0.9rem; font-weight: 700; flex-shrink: 0;
+  }
+  .user-info .name { font-size: 0.85rem; font-weight: 500; color: var(--ink-light); }
+  .user-info .time { font-size: 0.72rem; color: var(--muted); }
+  .kanji-display { padding: 28px 18px 20px; text-align: center; }
+  .kanji-main {
+    font-family: 'Noto Serif JP', serif; font-size: 5rem; font-weight: 900;
+    line-height: 1; color: var(--ink); letter-spacing: 0.05em;
+    position: relative; display: inline-block;
+  }
+  .kanji-main::after {
+    content: ''; position: absolute; bottom: -6px; left: 0; right: 0;
+    height: 3px; background: var(--gold-light);
+  }
+  .difficulty-badge {
+    display: inline-block; margin-top: 16px; background: var(--paper-dark);
+    border-radius: 20px; padding: 3px 12px;
+    font-size: 0.72rem; color: var(--muted); font-weight: 500; letter-spacing: 0.05em;
+  }
+  .difficulty-badge.hard   { background: #fde8e8; color: var(--vermillion); }
+  .difficulty-badge.medium { background: #fef5dc; color: var(--gold); }
+  .difficulty-badge.easy   { background: #e8f5e9; color: #2e7d32; }
+  .hint-section { padding: 0 18px 14px; font-size: 0.82rem; color: var(--muted); font-style: italic; }
+  .hint-label { font-style: normal; font-weight: 500; color: var(--gold); margin-right: 4px; font-size: 0.75rem; }
+  .answer-area { border-top: 1px solid var(--paper-dark); padding: 14px 18px; }
+  .answer-form { display: flex; gap: 8px; }
+  .answer-input {
+    flex: 1; border: 2px solid var(--paper-dark); border-radius: 4px;
+    padding: 8px 12px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.9rem; color: var(--ink); background: var(--paper); transition: border-color 0.2s;
+  }
+  .answer-input:focus { outline: none; border-color: var(--gold); }
+  .btn-answer {
+    background: var(--ink); color: white; border: none;
+    padding: 8px 16px; border-radius: 4px; cursor: pointer;
+    font-family: 'Noto Sans JP', sans-serif; font-size: 0.82rem; font-weight: 500;
+    transition: background 0.2s; white-space: nowrap;
+  }
+  .btn-answer:hover { background: var(--vermillion); }
+  .btn-answer:disabled { opacity: 0.5; cursor: not-allowed; }
+  .answer-result {
+    padding: 10px 14px; border-radius: 4px; font-size: 0.85rem; font-weight: 500;
+    display: none; align-items: center; gap: 8px; margin-top: 8px;
+  }
+  .answer-result.correct { background: #e8f5e9; color: #2e7d32; display: flex; }
+  .answer-result.wrong   { background: #fde8e8; color: var(--vermillion); display: flex; }
+  .answer-count { font-size: 0.75rem; color: var(--muted); margin-top: 8px; text-align: right; }
+  .stats-bar { border-top: 1px solid var(--paper-dark); padding: 10px 18px; display: flex; gap: 16px; }
+  .stat { font-size: 0.78rem; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+
+  /* Action bar */
+  .action-bar { border-top: 1px solid var(--paper-dark); padding: 8px 14px; display: flex; gap: 4px; }
+  .btn-action {
+    background: none; border: none; cursor: pointer;
+    padding: 6px 12px; border-radius: 20px;
+    font-family: 'Noto Sans JP', sans-serif; font-size: 0.82rem; color: var(--muted);
+    display: flex; align-items: center; gap: 5px; transition: background 0.15s, color 0.15s; font-weight: 500;
+  }
+  .btn-action:hover { background: var(--paper-dark); }
+  .btn-like.liked { color: var(--vermillion); background: #fde8e8; }
+  .btn-like.liked .like-icon { animation: heartPop 0.3s ease; }
+  @keyframes heartPop {
+    0% { transform: scale(1); } 50% { transform: scale(1.5); } 100% { transform: scale(1); }
+  }
+  .btn-comment.open { color: var(--gold); background: #fef5dc; }
+
+  /* Comments */
+  .comment-section {
+    border-top: 1px solid var(--paper-dark); background: var(--paper);
+    display: none; animation: slideDown 0.2s ease;
+  }
+  .comment-section.open { display: block; }
+  .comment-list { padding: 12px 18px 0; display: flex; flex-direction: column; gap: 10px; }
+  .comment-item { display: flex; gap: 8px; animation: fadeIn 0.2s ease; }
+  .comment-avatar {
+    width: 28px; height: 28px; border-radius: 50%; color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Noto Serif JP', serif; font-size: 0.72rem; font-weight: 700;
+    flex-shrink: 0; margin-top: 2px;
+  }
+  .comment-bubble {
+    background: white; border: 1px solid #d5c9b5; border-radius: 0 8px 8px 8px;
+    padding: 7px 12px; flex: 1;
+  }
+  .comment-user  { font-size: 0.72rem; font-weight: 700; color: var(--ink-light); margin-bottom: 2px; }
+  .comment-text  { font-size: 0.83rem; color: var(--ink); line-height: 1.5; }
+  .comment-time  { font-size: 0.68rem; color: var(--muted); margin-top: 3px; }
+  .comment-input-row { display: flex; gap: 8px; padding: 10px 18px 14px; align-items: center; }
+  .comment-my-avatar {
+    width: 28px; height: 28px; border-radius: 50%; background: var(--vermillion);
+    color: white; display: flex; align-items: center; justify-content: center;
+    font-family: 'Noto Serif JP', serif; font-size: 0.72rem; font-weight: 700; flex-shrink: 0;
+  }
+  .comment-field {
+    flex: 1; border: 1.5px solid var(--paper-dark); border-radius: 20px;
+    padding: 7px 14px; font-family: 'Noto Sans JP', sans-serif;
+    font-size: 0.83rem; background: white; color: var(--ink); transition: border-color 0.2s;
+  }
+  .comment-field:focus { outline: none; border-color: var(--gold); }
+  .comment-field:disabled { background: var(--paper-dark); cursor: not-allowed; }
+  .btn-send {
+    background: var(--ink); color: white; border: none;
+    width: 32px; height: 32px; border-radius: 50%; cursor: pointer; font-size: 0.9rem;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s, transform 0.15s; flex-shrink: 0;
+  }
+  .btn-send:hover { background: var(--vermillion); transform: scale(1.08); }
+  .btn-send:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  .feed-end { text-align: center; padding: 32px; font-size: 0.82rem; color: var(--muted); font-family: 'Noto Serif JP', serif; }
+  .fab {
+    position: fixed; bottom: 24px; right: 24px;
+    width: 52px; height: 52px; background: var(--vermillion); color: white;
+    border: none; border-radius: 50%; font-size: 1.5rem; cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    display: none; align-items: center; justify-content: center; transition: transform 0.2s;
+  }
+  .fab:hover { transform: scale(1.08); }
+  @media (max-width: 600px) {
+    .kanji-main { font-size: 4rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Auth Modal -->
+<div class="auth-overlay" id="authModal">
+  <div class="auth-box">
+    <div class="auth-header">
+      <div class="auth-title" id="authTitle">ログイン</div>
+      <button class="auth-close" onclick="hideAuth()">✕</button>
+    </div>
+    <div class="auth-field" id="authNameRow" style="display:none">
+      <label>ユーザー名</label>
+      <input type="text" id="authName" placeholder="表示名（例：田中）" maxlength="20"
+        onkeydown="if(event.key==='Enter')submitAuth()">
+    </div>
+    <div class="auth-field">
+      <label>メールアドレス</label>
+      <input type="email" id="authEmail" placeholder="example@email.com"
+        onkeydown="if(event.key==='Enter')submitAuth()">
+    </div>
+    <div class="auth-field">
+      <label>パスワード（6文字以上）</label>
+      <input type="password" id="authPassword" placeholder="••••••••"
+        onkeydown="if(event.key==='Enter')submitAuth()">
+    </div>
+    <div class="auth-error" id="authError"></div>
+    <button class="auth-submit" id="authSubmitBtn" onclick="submitAuth()">ログイン</button>
+    <div class="auth-toggle" id="authToggleText">
+      アカウントをお持ちでない方は <a href="#" id="authToggle">新規登録</a>
+    </div>
+  </div>
+</div>
+
+<!-- Header -->
+<header>
+  <div class="logo">
+    <div class="seal">読</div>
+    読めるかな？
+  </div>
+  <div id="headerRight" style="display:flex;gap:10px;align-items:center;">
+    <button class="btn-post" onclick="showAuth('login')">ログイン</button>
+    <button class="btn-register" onclick="showAuth('register')">新規登録</button>
+  </div>
+</header>
+
+<div class="container">
+  <!-- Post form -->
+  <div class="post-form" id="postForm">
+    <div class="form-title">難読漢字クイズを投稿する</div>
+    <div class="form-row">
+      <label>漢字（読めないと思うもの）</label>
+      <input class="kanji-input" type="text" id="kanjiInput" placeholder="例：蝸牛" maxlength="6">
+    </div>
+    <div class="form-row">
+      <label>正解の読み方</label>
+      <input class="text-input" type="text" id="answerInput" placeholder="例：かたつむり">
+    </div>
+    <div class="form-row">
+      <label>ヒント（省略可）</label>
+      <textarea class="text-input hint-input" id="hintInput" placeholder="例：梅雨の季節によく見かける生き物"></textarea>
+    </div>
+    <div class="form-row">
+      <label>難易度</label>
+      <select class="text-input" id="difficultyInput">
+        <option value="hard">🔴 超難問</option>
+        <option value="medium" selected>🟡 ふつう</option>
+        <option value="easy">🟢 かんたん</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn-cancel" onclick="document.getElementById('postForm').classList.remove('active')">キャンセル</button>
+      <button class="btn-submit" id="submitBtn" onclick="submitQuiz()">投稿する</button>
+    </div>
+  </div>
+
+  <div class="feed-header">
+    <span class="feed-title">タイムライン</span>
+  </div>
+
+  <div id="feed">
+    <div style="text-align:center;padding:40px;color:var(--muted);font-size:0.9rem;">読み込み中…</div>
+  </div>
+
+  <div class="feed-end">― 以上です ―</div>
+</div>
+
+<button class="fab" id="fab" onclick="toggleForm()">＋</button>
+
+</body>
+</html>
